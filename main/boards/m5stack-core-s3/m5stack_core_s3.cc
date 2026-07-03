@@ -7,6 +7,9 @@
 #include "i2c_device.h"
 #include "axp2101.h"
 #include "mcp_server.h"
+#include "lan_control_server.h"
+#include "settings.h"
+#include <string_view>
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -1365,6 +1368,8 @@ private:
     uint8_t si12t_last_state_ = 0;
     bool servo_ok_ = false;
     bool low_batt_warned_ = false;
+    // ---- Inbound LAN control channel (coexists with the xiaozhi cloud link) ----
+    LanControlServer* lan_control_server_ = nullptr;
 
     void InitializeBmi270() {
         // BMI270 实际在 0x69（不是 SDK 默认的 0x68），自己用 IDF i2c API + 底层 bmi270_init 绕过硬编码
@@ -1843,6 +1848,117 @@ private:
             });
     }
 
+    // self.play_audio_url — the LAN "speak" primitive (report §5.1). Fetches an Ogg/Opus
+    // file over the board's outbound HTTP (same pattern as self.screen.preview_image,
+    // mcp_server.cc:215-253) and plays it through the local decode queue (same path as
+    // AudioService::PlaySound, audio_service.cc:633-654). This is independent of the xiaozhi
+    // cloud session and of device state, so it speaks even while the device is idle.
+    //
+    // REQUIRED AUDIO FORMAT (device is the source of truth — the OggDemuxer + Opus decoder +
+    // PlaySound path expect exactly this): Ogg-encapsulated Opus, 16 kHz, mono, 60 ms frames.
+    // Confirmed from the pre-baked assets (main/assets/**/*.ogg are 16 kHz mono Opus) and the
+    // hard-coded 60 ms frame_duration in AudioService::PlaySound.
+    //
+    // Registered user-only (a system/push primitive, not a conversational-LLM tool). Enforces
+    // the shared token itself (defense-in-depth on top of the LanControlServer gate).
+    void RegisterPlayAudioMcpTool() {
+        auto& mcp = McpServer::GetInstance();
+        mcp.AddUserOnlyTool("self.play_audio_url",
+            "Fetch an audio file from a URL and play it out loud on the speaker "
+            "(Mac-initiated LAN 'speak'). The audio MUST be Ogg-encapsulated Opus, "
+            "16 kHz, mono, 60 ms frames. Requires the shared LAN control token.",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("token", kPropertyTypeString),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto token = props["token"].value<std::string>();
+                auto expected = LanControlServer::GetConfiguredToken();
+                if (expected.empty() || token != expected) {
+                    throw std::runtime_error("Unauthorized: token mismatch");
+                }
+                auto url = props["url"].value<std::string>();
+
+                // Outbound HTTP fetch — mirrors self.screen.preview_image.
+                auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+                if (!http->Open("GET", url)) {
+                    throw std::runtime_error("Failed to open URL: " + url);
+                }
+                int status_code = http->GetStatusCode();
+                if (status_code != 200) {
+                    http->Close();
+                    throw std::runtime_error("Unexpected status code: " + std::to_string(status_code));
+                }
+                size_t content_length = http->GetBodyLength();
+                if (content_length == 0) {
+                    http->Close();
+                    throw std::runtime_error("Empty/unknown Content-Length (serve the .ogg with a length): " + url);
+                }
+                char* data = (char*)heap_caps_malloc(content_length, MALLOC_CAP_SPIRAM);
+                if (data == nullptr) {
+                    http->Close();
+                    throw std::runtime_error("Failed to allocate memory for audio: " + url);
+                }
+                size_t total_read = 0;
+                while (total_read < content_length) {
+                    int ret = http->Read(data + total_read, content_length - total_read);
+                    if (ret < 0) {
+                        heap_caps_free(data);
+                        http->Close();
+                        throw std::runtime_error("Failed to download audio: " + url);
+                    }
+                    if (ret == 0) {
+                        break;
+                    }
+                    total_read += ret;
+                }
+                http->Close();
+
+                // Optional nicety: look like it's talking while the utterance plays.
+                auto display = GetDisplay();
+                if (display) {
+                    display->SetEmotion("speaking");
+                }
+                if (servo_ok_) {
+                    servo_.Nod();
+                }
+
+                // Feed the fetched bytes into the same local decode path as PlaySound.
+                // PlaySound demuxes synchronously (copies each Opus frame into its own queue
+                // packet) before returning, so freeing `data` right after is safe.
+                Application::GetInstance().GetAudioService().PlaySound(
+                    std::string_view(data, total_read));
+                heap_caps_free(data);
+
+                ESP_LOGI(TAG, "MCP play_audio_url: %s (%zu bytes)", url.c_str(), total_read);
+                return true;
+            });
+    }
+
+    // Bring up the inbound LAN control server AFTER the normal Wi-Fi + cloud link, and wire
+    // MCP replies to also broadcast back to LAN clients. Mirrors otto_robot.cc:228-248. The
+    // xiaozhi cloud connection is untouched — this only adds a second, local listener.
+    void InitializeLanControlServer() {
+        lan_control_server_ = new LanControlServer();
+        if (!lan_control_server_->Start(8080)) {
+            delete lan_control_server_;
+            lan_control_server_ = nullptr;
+            return;
+        }
+        Application::GetInstance().RegisterMcpBroadcastCallback([this](const std::string& payload) {
+            if (lan_control_server_) {
+                lan_control_server_->BroadcastMessage(payload);
+            }
+        });
+        ESP_LOGI(TAG, "LAN control server ready on ws://<device-ip>:8080/ws");
+    }
+
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        InitializeLanControlServer();
+    }
+
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, -1, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
@@ -2286,6 +2402,8 @@ public:
             RegisterExpressionMcpTool();
             RegisterServoMcpTools();
         }
+        // LAN "speak" tool — registered unconditionally (audio playback needs no servo/PY32).
+        RegisterPlayAudioMcpTool();
 
         InitializeSpi();
         InitializeIli9342Display();

@@ -6,6 +6,17 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config LAN_CONTROL_TOKEN
+    string "LAN control shared token (m5stack-core-s3)"
+    default ""
+    help
+        Compile-time default shared secret for the inbound LAN control channel on the
+        m5stack-core-s3 board (ws://<device-ip>:8080/ws). Every LAN request (and the
+        self.play_audio_url tool) must carry a "token" matching this value. Leave EMPTY
+        to keep the LAN channel disabled (fail-closed) until a token is set at runtime via
+        the NVS namespace "lan_ctrl" key "token", which overrides this default. Do not commit
+        a real secret here.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

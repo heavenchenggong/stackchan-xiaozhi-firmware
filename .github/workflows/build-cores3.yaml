@@ -3,6 +3,8 @@ name: Build CoreS3 (StackChan-XiaoZhi)
 on:
   push:
     branches: [main, codex-refactor]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
