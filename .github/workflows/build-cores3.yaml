@@ -3,7 +3,11 @@ name: Build CoreS3 (StackChan-XiaoZhi)
 on:
   push:
     branches: [main, codex-refactor]
+    tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -72,4 +76,34 @@ jobs:
         with:
           name: stackchan-xiaozhi-cores3-${{ github.sha }}
           path: out/
-          retention-days: 14
+          retention-days: 90
+
+      # 打了 v* tag 时，把固件作为 GitHub Release 附件发布（Release 附件永不过期，
+      # 解决 Actions artifact 只保留 90 天、下载链接失效的问题）。
+      - name: Publish firmware to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/xiaozhi.bin
+            out/bootloader.bin
+            out/partition-table.bin
+            out/ota_data_initial.bin
+            out/srmodels.bin
+            out/generated_assets.bin
+            out/merged-binary.bin
+          body: |
+            ## Stack-chan XiaoZhi firmware — flashable binaries
+
+            **Quick flash (recommended):** one command with `merged-binary.bin`:
+            ```bash
+            esptool.py --chip esp32s3 -p /dev/YOUR_PORT -b 460800 \
+              --before default_reset --after hard_reset \
+              write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
+              0x0 merged-binary.bin
+            ```
+
+            Individual partitions (`bootloader.bin` @ 0x0, `partition-table.bin` @ 0x8000,
+            `ota_data_initial.bin` @ 0xd000, `srmodels.bin` @ 0x10000, `xiaozhi.bin` @ 0x410000,
+            `generated_assets.bin` @ 0xa10000) are also attached.
+          fail_on_unmatched_files: false
