@@ -11,7 +11,7 @@
 
 完整说明 + 部署步骤 → **[heavenchenggong/stackchan-claude-bridge](https://github.com/heavenchenggong/stackchan-claude-bridge)**
 
-下载预编译固件 → [Actions Artifacts](https://github.com/heavenchenggong/stackchan-xiaozhi-firmware/actions/workflows/build-cores3.yaml)
+下载预编译固件 → [Releases](https://github.com/heavenchenggong/stackchan-xiaozhi-firmware/releases/latest)（`merged-binary.bin` 一键烧录，永久有效）
 
 ---
 
