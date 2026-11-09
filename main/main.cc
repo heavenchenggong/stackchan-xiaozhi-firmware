@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 
 #include "application.h"
+#include "usb_mcp_bridge.h"
 
 #define TAG "main"
 
@@ -25,5 +26,8 @@ extern "C" void app_main(void)
     // Initialize and run the application
     auto& app = Application::GetInstance();
     app.Initialize();
+    // 数据线（USB Serial/JTAG）上的 MCP 通道，不依赖 Wi-Fi；
+    // 独立 task，放在 Run() 之前启动。
+    UsbMcpStart();
     app.Run();  // This function runs the main event loop and never returns
 }

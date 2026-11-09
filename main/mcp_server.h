@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <mbedtls/base64.h>
 
 #include <cJSON.h>
@@ -313,10 +314,25 @@ public:
 
 class McpServer {
 public:
+    // JSON-RPC id 从该值起保留给本地 HTTP 桥（NotifyHttpServer 的 /mcp、/tools）。
+    // 这些 id 的响应不再走 Application::SendMcpMessage()（wss 通道），而是交给
+    // SetResultSink() 注册的同步接收器，让局域网 HTTP 调用也能拿到工具返回值。
+    // 云端 wss 的 id 都是小整数，完全不受影响。
+    static constexpr int kHttpRpcIdBase = 1000000;
+    // USB Serial/JTAG 串口桥（usb_mcp_bridge）专用 id 段，与 HTTP 桥互不干扰，
+    // 也不依赖 HTTP server 是否已经启动（Wi-Fi 没连时也能用）。
+    static constexpr int kUsbRpcIdBase = 2000000;
+
+    using ResultSink = std::function<void(int id, const std::string& jsonrpc_response)>;
+
     static McpServer& GetInstance() {
         static McpServer instance;
         return instance;
     }
+
+    // 传 nullptr 取消接收。仅在设备本地 HTTP 服务启动时设置一次。
+    void SetResultSink(ResultSink sink) { result_sink_ = std::move(sink); }
+    void SetUsbResultSink(ResultSink sink) { usb_result_sink_ = std::move(sink); }
 
     void AddCommonTools();
     void AddUserOnlyTools();
@@ -339,6 +355,8 @@ private:
     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
 
     std::vector<McpTool*> tools_;
+    ResultSink result_sink_;
+    ResultSink usb_result_sink_;
 };
 
 #endif // MCP_SERVER_H

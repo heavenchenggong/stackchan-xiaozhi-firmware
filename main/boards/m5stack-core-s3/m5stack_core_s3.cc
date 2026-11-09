@@ -8,8 +8,12 @@
 #include "axp2101.h"
 #include "mcp_server.h"
 #include "notify_http_server.h"
+#include "settings.h"
+
+#include <string>
 
 #include <esp_log.h>
+#include <esp_system.h>
 #include <esp_heap_caps.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_io.h>
@@ -1082,6 +1086,33 @@ public:
         if (servo_) servo_->Tilt();
     }
 
+    // 给 MCP 用：单独叠加一层特效，不换表情。返回 false 表示名字不认识或
+    // avatar 还没初始化完（启动头几秒）。
+    bool SetOverlayByName(const char* name) {
+        if (!name || !avatar_.IsReady()) return false;
+        shizhou_avatar::Overlay o;
+        if      (!strcmp(name, "heart_eyes"))    o.heart_eyes = true;
+        else if (!strcmp(name, "tear"))          o.tear = true;
+        else if (!strcmp(name, "kiss_heart"))    o.kiss_heart = true;
+        else if (!strcmp(name, "cheek_blush"))   o.cheek_blush = true;
+        else if (!strcmp(name, "cool_glasses"))  o.cool_glasses = true;
+        else if (!strcmp(name, "excl_mark"))     o.excl_mark = true;
+        else if (!strcmp(name, "think_bubble"))  o.think_bubble = true;
+        else if (!strcmp(name, "star_burst"))    o.star_burst = true;
+        else if (!strcmp(name, "wave_squiggle")) o.wave_squiggle = true;
+        else if (!strcmp(name, "drool"))         o.drool = true;
+        else if (!strcmp(name, "laugh_lines"))   o.laugh_lines = true;
+        else if (!strcmp(name, "question_mark")) o.question_mark = true;
+        else if (!strcmp(name, "zzz"))           o.zzz = true;
+        else if (!strcmp(name, "none"))          { /* 全 false = 清掉 */ }
+        else return false;
+        DisplayLockGuard lock(this);
+        avatar_.SetOverlay(o);
+        SetActiveLocked(true);
+        BumpIdleTimerLocked();
+        return true;
+    }
+
     void SetEmotion(const char* emotion) override {
         SpiLcdDisplay::SetEmotion(emotion);
         DisplayLockGuard lock(this);
@@ -1241,6 +1272,15 @@ class Pmic : public Axp2101 {
 public:
     // Power Init
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
+        // 长按电源键 4 秒真正断电。之前这里只配了电源轨，AXP2101 的
+        // PWRON > OFFLEVEL 关机源没开，长按 6 秒只触发硬件复位（重启），
+        // 加上内置电池，看起来就是「怎么都关不掉」。
+        // 0x22 bit2: PWRON > OFFLEVEL as POWEROFF source enable
+        // 0x27 0x10: hold 4s to power off
+        // 写法与 kevin-box-2 / tudouzi / waveshare 等板卡一致。
+        WriteReg(0x22, 0b110);
+        WriteReg(0x27, 0x10);
+
         uint8_t data = ReadReg(0x90);
         data |= 0b10110100;
         WriteReg(0x90, data);
@@ -1354,6 +1394,10 @@ private:
     // ---- PY32 持久 I2C 设备句柄（控 LED + 其他扩展）----
     i2c_master_dev_handle_t py32_dev_ = nullptr;
     bool led_manual_ = false;
+    // ---- 12 灯内置动画（self.led.pattern）----
+    esp_timer_handle_t led_pattern_timer_ = nullptr;
+    std::string led_pattern_;
+    int led_pattern_frame_ = 0;
     // ---- BMI270 (IMU) ----
     i2c_master_dev_handle_t bmi_i2c_dev_ = nullptr;
     struct bmi2_dev bmi_dev_storage_ = {};
@@ -1534,6 +1578,15 @@ private:
     //   REG_LED_CFG  (0x24): 低6位=LED数量, bit6=1 触发刷新
     //   REG_LED_RAM  (0x30+): 颜色数据起点，每颗 LED 2 字节 RGB565 little-endian
 
+    // 单 bit 读改写：pin 0-7 用 low 寄存器，8-15 用 high 寄存器。
+    bool Py32WriteBit(uint8_t reg, uint8_t bit, bool value) {
+        uint8_t v = 0;
+        if (!Py32ReadReg(reg, &v)) return false;
+        if (value) v |= (uint8_t)(1u << bit);
+        else       v &= (uint8_t)~(1u << bit);
+        return Py32WriteRegBlock(reg, &v, 1);
+    }
+
     void InitializePy32LedDevice() {
         i2c_device_config_t dev_cfg = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -1545,21 +1598,56 @@ private:
             py32_dev_ = nullptr;
             return;
         }
-        // 设 LED 数量 = 12
-        uint8_t cmd[2] = {0x24, 12};
-        i2c_master_transmit(py32_dev_, cmd, 2, 200);
+
+        // 注意：这里**故意不碰** PY32 的 GPIO 寄存器（0x04/0x0A/0x0C/0x14）。
+        // 2026-11-08 曾在启动阶段做 read-modify-write 配置 GPIO13，结果设备
+        // 启动阶段卡死、USB 串口 0 字节（esptool 仍能连）。GPIO13 的配置改成
+        // 手动工具 self.led.init，避免把启动流程变成不可恢复的路径。
+        uint8_t led_count = 12;
+        Py32WriteRegBlock(0x24, &led_count, 1);
         uint16_t off[12] = {};
         Py32SetLedFrame(off, 12);
         ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
     }
 
+    // PY32 在内部刷 WS2812 时会短暂不响应 I2C，单次写经常 NACK。
+    // 上游 stackchan 的 SafeWriteReg / SafeReadReg 都带重试，这里对齐：
+    // 5 次 + 2ms 退避，失败打日志（以前静默丢掉，工具还照样返回 true）。
     bool Py32WriteRegBlock(uint8_t reg, const uint8_t* data, size_t len) {
         if (!py32_dev_) return false;
         static uint8_t buf[80];
         if (len + 1 > sizeof(buf)) return false;
         buf[0] = reg;
         memcpy(buf + 1, data, len);
-        return i2c_master_transmit(py32_dev_, buf, len + 1, 200) == ESP_OK;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (i2c_master_transmit(py32_dev_, buf, len + 1, 200) == ESP_OK) return true;
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        ESP_LOGW(TAG, "PY32: write reg 0x%02X failed after 5 tries", reg);
+        return false;
+    }
+
+    bool Py32ReadReg(uint8_t reg, uint8_t* value) {
+        if (!py32_dev_ || value == nullptr) return false;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (i2c_master_transmit_receive(py32_dev_, &reg, 1, value, 1, 200) == ESP_OK) return true;
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        ESP_LOGW(TAG, "PY32: read reg 0x%02X failed after 5 tries", reg);
+        return false;
+    }
+
+    // 单次、不重试的读写：给 self.led.probe / self.led.init 用。
+    // 怀疑某些寄存器读会卡住总线时，重试会把一次调用拖成好几秒，这里只试一次。
+    bool Py32ReadRegOnce(uint8_t reg, uint8_t* value) {
+        if (!py32_dev_ || value == nullptr) return false;
+        return i2c_master_transmit_receive(py32_dev_, &reg, 1, value, 1, 100) == ESP_OK;
+    }
+
+    bool Py32WriteRegOnce(uint8_t reg, uint8_t value) {
+        if (!py32_dev_) return false;
+        uint8_t buf[2] = {reg, value};
+        return i2c_master_transmit(py32_dev_, buf, 2, 100) == ESP_OK;
     }
 
     bool Py32SetLedFrame(const uint16_t* rgb565_colors, size_t count) {
@@ -1570,14 +1658,100 @@ private:
             data[i * 2]     = rgb565_colors[i] & 0xFF;
             data[i * 2 + 1] = (rgb565_colors[i] >> 8) & 0xFF;
         }
-        bool ok1 = Py32WriteRegBlock(0x30, data, count * 2);
-        uint8_t refresh = (uint8_t)(count | 0x40);
-        bool ok2 = Py32WriteRegBlock(0x24, &refresh, 1);
-        return ok1 && ok2;
+        if (!Py32WriteRegBlock(0x30, data, count * 2)) return false;
+
+        // 0x24 = count[5:0] + latch[6]，latch 是 self-clearing strobe。
+        // 必须 read-modify-write 保留 count 与高位状态；以前直接写
+        // (count|0x40) 会把高位清掉，而且没有重试，是灯「调用了但不变色」的主因。
+        uint8_t cfg = 0;
+        if (!Py32ReadReg(0x24, &cfg)) return false;
+        uint8_t latch = (uint8_t)(cfg | (1u << 6));
+        return Py32WriteRegBlock(0x24, &latch, 1);
     }
 
     static uint16_t Rgb888To565(uint8_t r, uint8_t g, uint8_t b) {
         return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
+    }
+
+    // ── 12 灯内置动画 ────────────────────────────────────────────────
+    // 全部复用已有的 Py32SetLedFrame()（一次 I2C burst 刷 12 颗），不引入
+    // 新驱动；动画跑在 ESP timer task 上，不占主循环。
+    static void LedPatternTimerCb(void* arg) {
+        static_cast<M5StackCoreS3Board*>(arg)->LedPatternTick();
+    }
+
+    bool LedPatternTick() {
+        if (!py32_dev_ || led_pattern_.empty()) return false;
+        uint16_t frame[12] = {};
+        int f = led_pattern_frame_++;
+        if (led_pattern_ == "rainbow") {
+            static const uint8_t palette[12][3] = {
+                {255,  40,  40}, {255, 110,  20}, {255, 180,   0}, {210, 230,   0},
+                {120, 240,  30}, { 20, 240, 110}, {  0, 220, 220}, { 30, 150, 255},
+                { 90,  90, 255}, {170,  60, 255}, {240,  50, 190}, {255,  60, 110},
+            };
+            for (int i = 0; i < 12; i++) {
+                const uint8_t* c = palette[(i + f) % 12];
+                frame[i] = Rgb888To565(c[0], c[1], c[2]);
+            }
+        } else if (led_pattern_ == "breath") {
+            // 三角波，避免浮点
+            int level = abs((f % 40) - 20) * 255 / 20;
+            uint16_t c = Rgb888To565(level, level, level);
+            for (int i = 0; i < 12; i++) frame[i] = c;
+        } else if (led_pattern_ == "chase") {
+            for (int i = 0; i < 12; i++) {
+                int d = (i - (f % 12) + 12) % 12;
+                uint8_t v = d == 0 ? 255 : (d == 1 ? 90 : (d == 2 ? 30 : 0));
+                frame[i] = Rgb888To565(v, v / 2, 0);
+            }
+        } else {
+            return false;
+        }
+        return Py32SetLedFrame(frame, 12);
+    }
+
+    void StopLedPattern() {
+        if (led_pattern_timer_ != nullptr) {
+            esp_timer_stop(led_pattern_timer_);
+        }
+        led_pattern_.clear();
+    }
+
+    bool StartLedPattern(const std::string& name, int speed_ms) {
+        if (name == "off") {
+            StopLedPattern();
+            return true;
+        }
+        if (name != "rainbow" && name != "breath" && name != "chase") {
+            return false;
+        }
+        if (speed_ms < 40) speed_ms = 40;
+        if (speed_ms > 2000) speed_ms = 2000;
+        if (led_pattern_timer_ == nullptr) {
+            esp_timer_create_args_t args = {};
+            args.callback = &M5StackCoreS3Board::LedPatternTimerCb;
+            args.arg = this;
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "led_pattern";
+            args.skip_unhandled_events = true;
+            if (esp_timer_create(&args, &led_pattern_timer_) != ESP_OK) {
+                led_pattern_timer_ = nullptr;
+                return false;
+            }
+        } else {
+            esp_timer_stop(led_pattern_timer_);
+        }
+        led_pattern_ = name;
+        led_pattern_frame_ = 0;
+        led_manual_ = true;  // 暂停情绪灯联动，别把动画覆盖掉
+        // 先同步写第一帧：写不进去就别启动 timer，避免「动画在跑但灯不动」
+        if (!LedPatternTick()) {
+            StopLedPattern();
+            ESP_LOGW(TAG, "LED pattern first frame failed (I2C)");
+            return false;
+        }
+        return esp_timer_start_periodic(led_pattern_timer_, (uint64_t)speed_ms * 1000) == ESP_OK;
     }
 
     void UpdateLedsFromEmotion(const char* emotion) {
@@ -1731,10 +1905,13 @@ private:
                 uint8_t r = props["r"].value<int>();
                 uint8_t g = props["g"].value<int>();
                 uint8_t b = props["b"].value<int>();
+                StopLedPattern();
                 uint16_t color = Rgb888To565(r, g, b);
                 uint16_t colors[12];
                 for (int i = 0; i < 12; i++) colors[i] = color;
-                Py32SetLedFrame(colors, 12);
+                if (!Py32SetLedFrame(colors, 12)) {
+                    return std::string("LED I2C write failed (PY32 busy or not responding)");
+                }
                 led_manual_ = true;
                 ESP_LOGI(TAG, "MCP set LED color: r=%d g=%d b=%d", r, g, b);
                 return true;
@@ -1743,8 +1920,11 @@ private:
             "Turn off the LED ring light.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
+                StopLedPattern();
                 uint16_t off[12] = {};
-                Py32SetLedFrame(off, 12);
+                if (!Py32SetLedFrame(off, 12)) {
+                    return std::string("LED I2C write failed (PY32 busy or not responding)");
+                }
                 led_manual_ = true;
                 ESP_LOGI(TAG, "MCP LED off");
                 return true;
@@ -1753,9 +1933,188 @@ private:
             "Set LED back to automatic emotion-based color mode.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
+                StopLedPattern();
                 led_manual_ = false;
                 ESP_LOGI(TAG, "MCP LED auto mode");
                 return true;
+            });
+
+        // ── 功能整合新增 ──────────────────────────────────────────────
+        // 12 颗灯逐颗上色：逗号分隔的 #RRGGBB 或 0xRRGGBB，最多 12 个；
+        // 少于 12 个时剩下的灯复用最后一个颜色。brightness 0-100 统一缩放。
+        mcp.AddTool("self.led.set_many",
+            "Set each of the 12 ring LEDs individually. 'colors' is a comma-separated "
+            "list of up to 12 hex colors (#RRGGBB or 0xRRGGBB); a shorter list repeats "
+            "the last color for the remaining LEDs. 'brightness' scales all of them (0-100).",
+            PropertyList({
+                Property("colors", kPropertyTypeString),
+                Property("brightness", kPropertyTypeInteger, 100, 0, 100),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                if (!py32_dev_) return std::string("LED controller not available");
+                auto spec = props["colors"].value<std::string>();
+                int brightness = props["brightness"].value<int>();
+                uint16_t colors[12] = {};
+                int count = 0;
+                size_t pos = 0;
+                while (count < 12 && pos < spec.size()) {
+                    size_t end = spec.find(',', pos);
+                    if (end == std::string::npos) end = spec.size();
+                    std::string token = spec.substr(pos, end - pos);
+                    // 去掉空白和前缀
+                    size_t first = token.find_first_not_of(" \t#");
+                    if (first == std::string::npos) { pos = end + 1; continue; }
+                    std::string hex = token.substr(first);
+                    if (hex.rfind("0x", 0) == 0 || hex.rfind("0X", 0) == 0) hex = hex.substr(2);
+                    unsigned long rgb = strtoul(hex.c_str(), nullptr, 16);
+                    uint8_t r = (rgb >> 16) & 0xFF;
+                    uint8_t g = (rgb >> 8) & 0xFF;
+                    uint8_t b = rgb & 0xFF;
+                    r = (uint8_t)(r * brightness / 100);
+                    g = (uint8_t)(g * brightness / 100);
+                    b = (uint8_t)(b * brightness / 100);
+                    colors[count++] = Rgb888To565(r, g, b);
+                    if (end == spec.size()) break;
+                    pos = end + 1;
+                }
+                if (count == 0) return std::string("no valid colors");
+                for (int i = count; i < 12; i++) colors[i] = colors[count - 1];
+                StopLedPattern();
+                if (!Py32SetLedFrame(colors, 12)) {
+                    return std::string("LED I2C write failed (PY32 busy or not responding)");
+                }
+                led_manual_ = true;
+                ESP_LOGI(TAG, "MCP LED set_many: %d colors @ %d%%", count, brightness);
+                return true;
+            });
+
+        // gateway 兼容别名（stackchan-mcp 的 clear_leds 映射到 self.led.clear）
+        mcp.AddTool("self.led.clear",
+            "Turn off all 12 ring LEDs. Alias of self.led.turn_off.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                StopLedPattern();
+                uint16_t off[12] = {};
+                if (!Py32SetLedFrame(off, 12)) {
+                    return std::string("LED I2C write failed (PY32 busy or not responding)");
+                }
+                led_manual_ = true;
+                return true;
+            });
+
+        mcp.AddTool("self.led.pattern",
+            "Run a built-in animation on the 12-LED ring. "
+            "name: rainbow (rotating rainbow), breath (white breathing), "
+            "chase (orange running light), off (stop animation). "
+            "speed_ms is the frame period (40-2000, default 120).",
+            PropertyList({
+                Property("name", kPropertyTypeString),
+                Property("speed_ms", kPropertyTypeInteger, 120, 40, 2000),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto name = props["name"].value<std::string>();
+                int speed = props["speed_ms"].value<int>();
+                if (!StartLedPattern(name, speed)) {
+                    return std::string("failed to start pattern '") + name +
+                           "' (unknown name or LED I2C write failed)";
+                }
+                ESP_LOGI(TAG, "MCP LED pattern: %s @ %dms", name.c_str(), speed);
+                return true;
+            });
+
+        // 诊断：回读 PY32 的 0x24 配置与 0x30/0x31 第一颗灯颜色，
+        // 用来区分「工具没调用」「I2C 写失败」「写了但被别的源覆盖」。
+        mcp.AddTool("self.led.status",
+            "Read back the PY32 LED controller registers to diagnose a ring that "
+            "does not change color. Returns the config/latch register (0x24), "
+            "the first LED's RGB565 bytes (0x30/0x31), and the manual/pattern state.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                uint8_t cfg = 0, lo = 0, hi = 0, dir = 0, pu = 0, drv = 0;
+                bool ok_cfg = Py32ReadReg(0x24, &cfg);
+                bool ok_ram = Py32ReadReg(0x30, &lo) && Py32ReadReg(0x31, &hi);
+                bool ok_gpio = Py32ReadReg(0x04, &dir) && Py32ReadReg(0x0A, &pu) &&
+                               Py32ReadReg(0x14, &drv);
+                uint16_t rgb565 = (uint16_t)lo | ((uint16_t)hi << 8);
+                bool pin13_out = (dir & 0x20) != 0;
+                bool pin13_pullup = (pu & 0x20) != 0;
+                bool pin13_pp = (drv & 0x20) == 0;
+                return std::string("{\"i2c_ok\":") + (ok_cfg && ok_ram && ok_gpio ? "true" : "false") +
+                       ",\"cfg_0x24\":" + std::to_string(cfg) +
+                       ",\"led0_rgb565\":" + std::to_string(rgb565) +
+                       ",\"gpio13_output\":" + (pin13_out ? "true" : "false") +
+                       ",\"gpio13_pullup\":" + (pin13_pullup ? "true" : "false") +
+                       ",\"gpio13_pushpull\":" + (pin13_pp ? "true" : "false") +
+                       ",\"dir_0x04\":" + std::to_string(dir) +
+                       ",\"pu_0x0a\":" + std::to_string(pu) +
+                       ",\"drv_0x14\":" + std::to_string(drv) +
+                       ",\"manual\":" + (led_manual_ ? "true" : "false") +
+                       ",\"pattern\":\"" + led_pattern_ + "\"}";
+            });
+
+        // 单次寄存器读写，用来定位「哪个 PY32 寄存器操作会把 I2C 卡死」。
+        mcp.AddTool("self.led.probe",
+            "Low-level PY32 register probe (single-shot, no retry). "
+            "action: read|write, reg: 0-255, value: 0-255 (write only). "
+            "Use it to check whether 0x04/0x0a/0x0c/0x14 are readable before "
+            "configuring GPIO13.",
+            PropertyList({
+                Property("action", kPropertyTypeString),
+                Property("reg", kPropertyTypeInteger, 0, 0, 255),
+                Property("value", kPropertyTypeInteger, 0, 0, 255),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto action = props["action"].value<std::string>();
+                int reg = props["reg"].value<int>();
+                int value = props["value"].value<int>();
+                if (action == "read") {
+                    uint8_t v = 0;
+                    bool ok = Py32ReadRegOnce((uint8_t)reg, &v);
+                    return std::string("{\"ok\":") + (ok ? "true" : "false") +
+                           ",\"op\":\"read\",\"reg\":" + std::to_string(reg) +
+                           ",\"value\":" + std::to_string(ok ? (int)v : -1) + "}";
+                }
+                if (action == "write") {
+                    bool ok = Py32WriteRegOnce((uint8_t)reg, (uint8_t)value);
+                    return std::string("{\"ok\":") + (ok ? "true" : "false") +
+                           ",\"op\":\"write\",\"reg\":" + std::to_string(reg) +
+                           ",\"value\":" + std::to_string(value) + "}";
+                }
+                return std::string("action must be read or write");
+            });
+
+        // 手动配置 PY32 GPIO13（WS2812 数据线）：输出 + 上拉 + push-pull。
+        // 只在显式调用时执行，不放进启动流程，避免像 2026-11-08 那次把设备卡死。
+        mcp.AddTool("self.led.init",
+            "Configure PY32 GPIO13 (the WS2812 data line) as output + pull-up + "
+            "push-pull, then set LED count and clear the strip. Required before "
+            "the ring can change colour. Returns per-step register values; "
+            "-1 means read failed, -2 means write failed.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                auto rmw = [this](uint8_t reg, uint8_t bit, bool value) -> int {
+                    uint8_t cur = 0;
+                    if (!Py32ReadRegOnce(reg, &cur)) return -1;
+                    uint8_t next = value ? (uint8_t)(cur | (1u << bit))
+                                         : (uint8_t)(cur & ~(1u << bit));
+                    return Py32WriteRegOnce(reg, next) ? (int)next : -2;
+                };
+                int dir = rmw(0x04, 5, true);   // GPIO13 = output
+                int pu  = rmw(0x0A, 5, true);   // pull-up on
+                int pd  = rmw(0x0C, 5, false);  // pull-down off
+                int drv = rmw(0x14, 5, false);  // push-pull
+                bool ok_cnt = Py32WriteRegOnce(0x24, 12);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                uint16_t off[12] = {};
+                bool ok_frame = Py32SetLedFrame(off, 12);
+                ESP_LOGI(TAG, "MCP led.init: dir=%d pu=%d pd=%d drv=%d cnt=%d frame=%d",
+                         dir, pu, pd, drv, ok_cnt, ok_frame);
+                return std::string("{\"dir_0x04\":") + std::to_string(dir) +
+                       ",\"pu_0x0a\":" + std::to_string(pu) +
+                       ",\"pd_0x0c\":" + std::to_string(pd) +
+                       ",\"drv_0x14\":" + std::to_string(drv) +
+                       ",\"count\":" + (ok_cnt ? "true" : "false") +
+                       ",\"frame\":" + (ok_frame ? "true" : "false") + "}";
             });
     }
 
@@ -1790,6 +2149,7 @@ private:
                 Property("pitch", kPropertyTypeInteger, 5, 60),
             }),
             [this, move_with_pause](const PropertyList& props) -> ReturnValue {
+                if (!servo_ok_) return std::string("servo unavailable");
                 int yaw = props["yaw"].value<int>();
                 int pitch = props["pitch"].value<int>();
                 move_with_pause(yaw, pitch, 800);
@@ -1803,6 +2163,7 @@ private:
             "'回正', 'look at me', 'face front', etc.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
+                if (!servo_ok_) return std::string("servo unavailable");
                 // 先锁着移动到 center
                 face_tracker_.SetManualLock(true);
                 face_tracker_.Pause(false);
@@ -1829,6 +2190,7 @@ private:
             "Use when user says nod, agree, say yes, greet, etc.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
+                if (!servo_ok_) return std::string("servo unavailable");
                 servo_.Nod();
                 ESP_LOGI(TAG, "MCP head nod");
                 return true;
@@ -1839,6 +2201,7 @@ private:
             "Use when user says shake head, disagree, refuse, say no, etc.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
+                if (!servo_ok_) return std::string("servo unavailable");
                 servo_.Shake();
                 ESP_LOGI(TAG, "MCP head shake");
                 return true;
@@ -1904,6 +2267,129 @@ private:
                     servo_.Nod();
                 }
                 ESP_LOGI(TAG, "MCP notify dismiss");
+                return true;
+            });
+    }
+
+    // ── 功能整合：把板卡里已有但没暴露的能力补成 MCP 工具 ──────────────
+    // 原则：不新增硬件依赖、不替换现有板卡实现，只做"盘活"。
+    void RegisterExtraMcpTools() {
+        auto& mcp = McpServer::GetInstance();
+
+        mcp.AddTool("self.face.list",
+            "List all facial expression names this robot can show, plus the available "
+            "overlay effect names. Call this before self.face.expression / self.face.overlay "
+            "when you are unsure which names are valid.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                return std::string(
+                    "expressions: neutral,happy,laughing,funny,sad,crying,angry,loving,"
+                    "embarrassed,surprised,shocked,thinking,winking,cool,relaxed,"
+                    "delicious,kissy,confident,sleepy,silly,confused; "
+                    "overlays: none,heart_eyes,tear,kiss_heart,cheek_blush,cool_glasses,"
+                    "excl_mark,think_bubble,star_burst,wave_squiggle,drool,laugh_lines,"
+                    "question_mark,zzz");
+            });
+
+        mcp.AddTool("self.face.overlay",
+            "Overlay a small effect on the current face without changing the expression: "
+            "heart_eyes, tear, kiss_heart, cheek_blush, cool_glasses, excl_mark, "
+            "think_bubble, star_burst, wave_squiggle, drool, laugh_lines, "
+            "question_mark, zzz, or none to clear. Returns false if the name is unknown.",
+            PropertyList({
+                Property("name", kPropertyTypeString)
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto name = props["name"].value<std::string>();
+                auto* disp = static_cast<M5StackAvatarDisplay*>(display_);
+                if (disp == nullptr) return false;
+                return disp->SetOverlayByName(name.c_str());
+            });
+
+        mcp.AddTool("self.head.get_angles",
+            "Read the head's last commanded yaw and pitch in degrees.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                return std::string("{\"yaw\":") + std::to_string(servo_.GetCurrentYaw()) +
+                       ",\"pitch\":" + std::to_string(servo_.GetCurrentPitch()) + "}";
+            });
+
+        mcp.AddTool("self.head.tilt",
+            "Cutely tilt the head to one side (the same gesture as being petted). "
+            "Use for greetings, affection, or playful reactions.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!servo_ok_) return std::string("servo unavailable");
+                servo_.Tilt();
+                return true;
+            });
+
+        // 不重编译切本地 gateway / 切回小智云。
+        // WebsocketProtocol::OpenAudioChannel() 读 namespace "websocket" 的
+        // url / token / version；Ota 读 namespace "wifi" 的 ota_url。
+        mcp.AddTool("self.gateway_config.get",
+            "Read the current voice/WebSocket endpoint configuration stored in NVS "
+            "(websocket url, whether a token is set, protocol version, ota url). "
+            "Token value is never returned.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                Settings ws("websocket", false);
+                Settings wifi("wifi", false);
+                std::string url = ws.GetString("url");
+                return std::string("{\"websocket_url\":\"") + url +
+                       "\",\"websocket_token_set\":" +
+                       (ws.GetString("token").empty() ? "false" : "true") +
+                       ",\"websocket_version\":" + std::to_string(ws.GetInt("version", 0)) +
+                       ",\"ota_url\":\"" + wifi.GetString("ota_url") +
+                       "\",\"mode\":\"" + (url.empty() ? "xiaozhi-cloud" : "custom-ws") + "\"}";
+            });
+
+        mcp.AddTool("self.gateway_config.set",
+            "Switch the robot between the Xiaozhi cloud and a self-hosted WebSocket "
+            "gateway by writing NVS keys. Leave url empty (or set clear=true) to go back "
+            "to the Xiaozhi cloud. Changes take effect after reboot; set restart=true "
+            "to reboot immediately.",
+            PropertyList({
+                Property("url", kPropertyTypeString, std::string("")),
+                Property("token", kPropertyTypeString, std::string("")),
+                Property("ota_url", kPropertyTypeString, std::string("")),
+                Property("version", kPropertyTypeInteger, 0, 0, 3),
+                Property("clear", kPropertyTypeBoolean, false),
+                Property("restart", kPropertyTypeBoolean, false),
+            }),
+            [](const PropertyList& props) -> ReturnValue {
+                std::string url = props["url"].value<std::string>();
+                std::string token = props["token"].value<std::string>();
+                std::string ota = props["ota_url"].value<std::string>();
+                int version = props["version"].value<int>();
+                bool clear = props["clear"].value<bool>();
+                bool restart = props["restart"].value<bool>();
+                {
+                    Settings ws("websocket", true);
+                    if (clear) {
+                        ws.EraseKey("url");
+                        ws.EraseKey("token");
+                        ws.SetInt("version", 0);  // 保证 nvs_commit
+                    } else {
+                        if (!url.empty()) ws.SetString("url", url);
+                        if (!token.empty()) ws.SetString("token", token);
+                        ws.SetInt("version", version);
+                    }
+                }
+                if (!ota.empty()) {
+                    Settings wifi("wifi", true);
+                    wifi.SetString("ota_url", ota);
+                }
+                ESP_LOGI(TAG, "gateway config: clear=%d url=%s restart=%d", clear, url.c_str(), restart);
+                if (restart) {
+                    esp_timer_create_args_t args = {};
+                    args.callback = [](void*) { esp_restart(); };
+                    args.name = "mcp_restart";
+                    esp_timer_handle_t timer = nullptr;
+                    if (esp_timer_create(&args, &timer) == ESP_OK) {
+                        esp_timer_start_once(timer, 800000);
+                    }
+                }
                 return true;
             });
     }
@@ -2347,11 +2833,15 @@ public:
             vTaskDelay(pdMS_TO_TICKS(200));
             servo_ok_ = servo_.Begin();
             InitializePy32LedDevice();
-            RegisterLedMcpTools();
-            RegisterExpressionMcpTool();
-            RegisterServoMcpTools();
-            RegisterNotifyMcpTools();  // Claude Code 提醒工具（HTTP + LLM 双入口）
         }
+        // 工具注册不再挂在 PY32 是否存在上：旧版一旦 PY32 探测失败，
+        // 连表情 / notify / 状态这些跟 PY32 无关的工具也全部消失。
+        // LED 与 servo 工具内部各自判空/判 servo_ok_，缺硬件时安全返回。
+        RegisterLedMcpTools();
+        RegisterExpressionMcpTool();
+        RegisterServoMcpTools();
+        RegisterNotifyMcpTools();
+        RegisterExtraMcpTools();
 
         InitializeSpi();
         InitializeIli9342Display();

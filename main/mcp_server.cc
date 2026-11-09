@@ -408,6 +408,14 @@ void McpServer::ReplyResult(int id, const std::string& result) {
     payload += std::to_string(id) + ",\"result\":";
     payload += result;
     payload += "}";
+    if (id >= kUsbRpcIdBase && usb_result_sink_) {
+        usb_result_sink_(id, payload);
+        return;
+    }
+    if (id >= kHttpRpcIdBase && result_sink_) {
+        result_sink_(id, payload);
+        return;
+    }
     Application::GetInstance().SendMcpMessage(payload);
 }
 
@@ -417,6 +425,14 @@ void McpServer::ReplyError(int id, const std::string& message) {
     payload += ",\"error\":{\"message\":\"";
     payload += message;
     payload += "\"}}";
+    if (id >= kUsbRpcIdBase && usb_result_sink_) {
+        usb_result_sink_(id, payload);
+        return;
+    }
+    if (id >= kHttpRpcIdBase && result_sink_) {
+        result_sink_(id, payload);
+        return;
+    }
     Application::GetInstance().SendMcpMessage(payload);
 }
 

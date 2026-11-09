@@ -2,6 +2,12 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 
+# 把主 console（含 stdin）接到 USB Serial/JTAG，数据线才能双向传 MCP JSON-RPC。
+# 默认主 console 是 UART0、USB Serial/JTAG 只做 secondary 日志输出，
+# 那样日志能看但 read(stdin) 永远读不到 Mac 发来的命令。
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 CONFIG_SPIRAM=y
